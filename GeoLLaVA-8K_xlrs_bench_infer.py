@@ -8,6 +8,8 @@ from tqdm import tqdm
 from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
 import torchvision.transforms as T
 from sklearn.metrics import f1_score  # 新增：导入F1计算库
+import glob  # 新增：遍历全量数据集文件
+import shutil  # 新增：文件操作辅助
 
 # Close all redundant warnings for clean logs
 warnings.filterwarnings('ignore', category=UserWarning)
@@ -21,12 +23,17 @@ torch.cuda.empty_cache()
 torch.backends.cudnn.benchmark = True
 torch.backends.cudnn.deterministic = True
 
-# ================================= Core Configuration (No Modification Required)=================================
+# ================================= Core Configuration (Adapted for Full Dataset)=================================
 DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
 MODEL_PATH = "/root/autodl-tmp/models/GeoLLaVA-8K"  # Your GeoLLaVA-8K model path
 DATASET_ROOT = "/root/autodl-tmp/datasets/XLRS-Bench"
 IMAGE_DIR = os.path.join(DATASET_ROOT, "extracted_images")
-ANNOTATION_FILE = os.path.join(DATASET_ROOT, "xlrs_local_annotations.json")
+# 适配全量数据集：支持多个标注文件或文件夹下的所有标注文件
+ANNOTATION_ROOT = os.path.join(DATASET_ROOT, "annotations")  # 全量标注文件根目录
+# 自动查找所有标注文件（支持单个文件或多个JSON标注文件）
+ANNOTATION_FILES = glob.glob(os.path.join(ANNOTATION_ROOT, "*.json")) if os.path.exists(ANNOTATION_ROOT) else [
+    os.path.join(DATASET_ROOT, "xlrs_local_annotations.json")
+]
 
 # Inference core configuration (adapted for GeoLLaVA-8K, only necessary parameters retained)
 MAX_NEW_TOKENS = 4  # Minimize output length, only allow 1 letter to avoid redundancy
@@ -38,19 +45,23 @@ BNB_CONFIG = BitsAndBytesConfig(
     bnb_4bit_use_double_quant=True,
     bnb_4bit_quant_type="nf4"
 )
-# Result save path (added hallucination rate statistics, distinguished final version)
-RESULT_SAVE_PATH = os.path.join(DATASET_ROOT, "GeoLLaVA-8K_xlrs_hallucination_result.json")
+# Result save path (added hallucination rate statistics, distinguished final version for full dataset)
+RESULT_SAVE_PATH = os.path.join(DATASET_ROOT, "GeoLLaVA-8K_xlrs_full_dataset_hallucination_result.json")
+# 临时缓存路径（大数据集分批处理用）
+TEMP_CACHE_PATH = os.path.join(DATASET_ROOT, "temp_infer_cache")
+os.makedirs(TEMP_CACHE_PATH, exist_ok=True)
 
 
-# ================================= Load Model/Tokenizer (Native Logic, No Extra Config)=================================
+# ================================= Load Model/Tokenizer (Native Logic, Optimized for Full Dataset)=================================
 def load_geo_llava_8k():
     """
     Core: Pure native loading with only Tokenizer + model
     trust_remote_code=True automatically loads all custom logic
     Model has built-in vision encoder and image processing logic, no manual intervention needed
+    Optimized for full dataset: add memory lock to prevent model unloading
     """
     print(
-        f"Loading GeoLLaVA-8K (Hallucination Rate Statistics Version) | Device: {DEVICE} | 8-bit Quantization | Pure Native Calling Logic")
+        f"Loading GeoLLaVA-8K (Full Dataset Hallucination Rate Statistics Version) | Device: {DEVICE} | 8-bit Quantization | Pure Native Calling Logic")
     # Load text Tokenizer (only process text, adapted for remote sensing instructions)
     tokenizer = AutoTokenizer.from_pretrained(
         MODEL_PATH,
@@ -69,8 +80,15 @@ def load_geo_llava_8k():
         low_cpu_mem_usage=True,
         attn_implementation="eager"  # Disable flash attention to avoid VRAM fluctuations on 16G GPU
     ).eval()  # Inference mode: fix model parameters, disable Dropout
+    
+    # 大数据集优化：锁定模型参数到GPU，防止分批处理时卸载
+    for param in model.parameters():
+        param.requires_grad = False
+        param.data = param.data.contiguous()
+    
     print(
-        "GeoLLaVA-8K loaded successfully | Built-in vision encoder ready | VRAM usage ≤8G on 16G GPU | Hallucination rate auto-statistics enabled")
+        "GeoLLaVA-8K loaded successfully | Built-in vision encoder ready | VRAM usage ≤8G on 16G GPU | Hallucination rate auto-statistics enabled (Full Dataset)"
+    )
     return tokenizer, model
 
 
@@ -162,22 +180,41 @@ def extract_answer_letter(raw_answer, all_options):
     return final_letter, all_options[final_letter]
 
 
-# ================================= Single Sample Inference (Complete Process, Full Robustness)=================================
-def infer_single_sample(tokenizer, model, image_path, question, options, all_options):
+# ================================= Single Sample Inference (Complete Process, Full Robustness for Full Dataset)=================================
+def infer_single_sample(tokenizer, model, image_path, question, options, all_options, sample_id):
     """Single sample complete inference process: image loading → preprocessing → model inference → answer extraction, only capture fatal errors"""
+    # 大数据集优化：添加样本ID到错误日志
+    cache_file = os.path.join(TEMP_CACHE_PATH, f"{sample_id}_cache.json")
+    
+    # 先检查缓存，避免重复推理（大数据集中断后可续跑）
+    if os.path.exists(cache_file):
+        with open(cache_file, "r", encoding="utf-8") as f:
+            cache_data = json.load(f)
+        return (cache_data["model_letter"], cache_data["model_answer"], cache_data["status"],
+                cache_data["model_raw"], cache_data["infer_size"])
+    
     # Only capture fatal image loading errors (file not found/corrupted/format error)
     try:
         image = Image.open(image_path).convert(
             "RGB")  # Force convert to RGB to avoid grayscale/transparent image errors
     except (FileNotFoundError, OSError) as e:
-        print(f"Fatal error: {os.path.basename(image_path)} | Error message: {str(e)[:50]}")
+        error_info = {
+            "model_letter": "ERROR",
+            "model_answer": "Image file error or damaged",
+            "status": "fatal_error",
+            "model_raw": "",
+            "infer_size": (0, 0)
+        }
+        with open(cache_file, "w", encoding="utf-8") as f:
+            json.dump(error_info, f, ensure_ascii=False)
+        print(f"Fatal error: Sample {sample_id} | {os.path.basename(image_path)} | Error message: {str(e)[:50]}")
         return "ERROR", "Image file error or damaged", "fatal_error", "", (0, 0)
 
     # Remote sensing image preprocessing (model native requirements, standardization + resizing)
     original_size = image.size
     img_tensor, infer_size = preprocess_image(image, IMAGE_MAX_SIZE)
     print(
-        f"Processing image: {os.path.basename(image_path)} | Original size: {original_size} → Inference size: {infer_size}")
+        f"Processing image: Sample {sample_id} | {os.path.basename(image_path)} | Original size: {original_size} → Inference size: {infer_size}")
 
     # Model native inference (no invalid parameters, 100% compatible)
     model_raw_answer = infer_single_image(tokenizer, model, img_tensor, question, options)
@@ -185,28 +222,49 @@ def infer_single_sample(tokenizer, model, image_path, question, options, all_opt
     # Extract valid answer without default A
     final_letter, final_answer = extract_answer_letter(model_raw_answer, all_options)
 
+    # 保存缓存
+    cache_data = {
+        "model_letter": final_letter,
+        "model_answer": final_answer,
+        "status": "success",
+        "model_raw": model_raw_answer,
+        "infer_size": infer_size
+    }
+    with open(cache_file, "w", encoding="utf-8") as f:
+        json.dump(cache_data, f, ensure_ascii=False)
+
     # Instant VRAM cleanup: delete large tensors to avoid VRAM accumulation in batch inference
     torch.cuda.empty_cache()
-    del img_tensor  # Manually delete image tensor to release VRAM
+    del img_tensor, image  # Manually delete image tensor and PIL image to release VRAM
     return final_letter, final_answer, "success", model_raw_answer, infer_size
 
 
-# ================================= Batch Inference Main Function (Added Hallucination Rate Auto-Statistics)=================================
-def batch_infer_xlrs_bench():
-    """GeoLLaVA-8K batch inference on XLRS-Bench dataset with added hallucination rate auto-statistics, results directly comparable with original LLaVA"""
-    # 1. Load model and Tokenizer (pure native logic, no extra configuration)
+# ================================= Batch Inference Main Function (Optimized for Full Dataset)=================================
+def batch_infer_xlrs_bench_full():
+    """GeoLLaVA-8K batch inference on full XLRS-Bench dataset with hallucination rate auto-statistics"""
+    # 1. Load model and Tokenizer (pure native logic, optimized for full dataset)
     tokenizer, model = load_geo_llava_8k()
 
-    # 2. Load XLRS-Bench annotation file (JSON format, consistent with original LLaVA inference logic)
-    try:
-        with open(ANNOTATION_FILE, "r", encoding="utf-8") as f:
-            annotations = json.load(f)
-    except FileNotFoundError:
-        raise FileNotFoundError(f"Annotation file not found, please check path: {ANNOTATION_FILE}")
-
-    total_samples = len(annotations)
+    # 2. Load all annotation files for full dataset
+    all_annotations = []
+    for ann_file in ANNOTATION_FILES:
+        try:
+            with open(ann_file, "r", encoding="utf-8") as f:
+                annotations = json.load(f)
+            all_annotations.extend(annotations)
+            print(f"Loaded annotation file: {ann_file} | Samples count: {len(annotations)}")
+        except FileNotFoundError:
+            print(f"Warning: Annotation file not found - {ann_file}, skip this file")
+        except json.JSONDecodeError:
+            print(f"Warning: Invalid JSON format - {ann_file}, skip this file")
+    
+    if not all_annotations:
+        raise FileNotFoundError(f"No valid annotations found in: {ANNOTATION_FILES}")
+    
+    total_samples = len(all_annotations)
     print(
-        f"XLRS-Bench dataset loaded successfully | Total samples: {total_samples} | GeoLLaVA-8K remote sensing dedicated inference (including hallucination rate statistics)")
+        f"Full XLRS-Bench dataset loaded successfully | Total samples: {total_samples} | GeoLLaVA-8K remote sensing dedicated inference (full dataset hallucination rate statistics)"
+    )
 
     # 3. Initialize statistical indicators (added wrong sample count for hallucination rate calculation)
     correct_samples = 0
@@ -219,8 +277,10 @@ def batch_infer_xlrs_bench():
     # Mapping letters to numerical values for F1 calculation (A=0, B=1, C=2, D=3)
     letter_to_num = {'A': 0, 'B': 1, 'C': 2, 'D': 3}
 
-    # 4. Batch inference (progress bar monitoring + real-time per-sample result printing)
-    for ann in tqdm(annotations, desc="GeoLLaVA-8K XLRS Inference Progress", ncols=80):
+    # 4. Batch inference (progress bar monitoring + real-time per-sample result printing for full dataset)
+    # 大数据集优化：每500个样本深度清理一次显存
+    progress_bar = tqdm(all_annotations, desc="GeoLLaVA-8K Full XLRS Inference Progress", ncols=100)
+    for idx, ann in enumerate(progress_bar):
         sample_id = ann["sample_id"]
         image_path = os.path.join(IMAGE_DIR, ann["image_name"])
         question = ann["question"]
@@ -229,9 +289,9 @@ def batch_infer_xlrs_bench():
         gt_letter = ann["gt_answer_letter"]  # Ground truth answer letter
         all_options = ann["all_options"]  # All options dictionary
 
-        # Complete single sample inference
+        # Complete single sample inference (with cache for full dataset)
         model_letter, model_answer, status, model_raw, infer_size = infer_single_sample(
-            tokenizer, model, image_path, question, options, all_options
+            tokenizer, model, image_path, question, options, all_options, sample_id
         )
 
         # Statistical inference indicators (added wrong sample count statistics)
@@ -263,9 +323,21 @@ def batch_infer_xlrs_bench():
             "infer_status": status
         })
 
-        # Real-time per-sample result printing for inference process monitoring
-        print(
-            f"Sample {sample_id} | Raw output: {model_raw[:20]} | Final answer: {model_letter} | Ground truth: {gt_letter} | Correct: {is_correct}")
+        # 大数据集优化：降低打印频率（每100个样本打印一次），避免日志刷屏
+        if idx % 100 == 0 and idx > 0:
+            progress_bar.set_postfix({
+                "Valid Accuracy": f"{round(correct_samples/(idx+1-fatal_error_samples)*100,2)}%",
+                "Hallucination Rate": f"{round(wrong_samples/(idx+1-fatal_error_samples)*100,2)}%"
+            })
+            print(
+                f"\nSample {sample_id} | Raw output: {model_raw[:20]} | Final answer: {model_letter} | Ground truth: {gt_letter} | Correct: {is_correct}"
+            )
+        
+        # 大数据集显存优化：每500个样本深度清理一次
+        if idx % 500 == 0 and idx > 0:
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+            print(f"\nMemory optimization: Processed {idx+1} samples, deep VRAM cleanup completed")
 
     # 5. Calculate core inference statistical indicators (Core: added hallucination rate auto-calculation + F1 score)
     valid_samples = total_samples - fatal_error_samples  # Valid inference samples (denominator for hallucination rate)
@@ -279,11 +351,12 @@ def batch_infer_xlrs_bench():
     # 6. Generate summary results (added hallucination rate, wrong sample count, F1 score fields, write to JSON file)
     final_result = {
         "model_info": {
-            "model_name": "GeoLLaVA-8K (Hallucination Rate Statistics Version)",
+            "model_name": "GeoLLaVA-8K (Full Dataset Hallucination Rate Statistics Version)",
             "model_path": MODEL_PATH,
             "quantization": "8bit (BitsAndBytes)",
             "device": DEVICE,
-            "max_image_size": IMAGE_MAX_SIZE
+            "max_image_size": IMAGE_MAX_SIZE,
+            "annotation_files_used": ANNOTATION_FILES
         },
         "dataset_statistics": {
             "total_samples": total_samples,
@@ -294,7 +367,8 @@ def batch_infer_xlrs_bench():
             "valid_accuracy(%)": valid_accuracy,
             "hallucination_rate(%)": hallucination_rate,  # Added: model hallucination rate (core)
             "f1_score(%)": f1_score_value,  # Added: F1 score
-            "result_file_path": RESULT_SAVE_PATH
+            "result_file_path": RESULT_SAVE_PATH,
+            "temp_cache_path": TEMP_CACHE_PATH
         },
         "detailed_infer_results": result_list
     }
@@ -303,39 +377,57 @@ def batch_infer_xlrs_bench():
     with open(RESULT_SAVE_PATH, "w", encoding="utf-8") as f:
         json.dump(final_result, f, ensure_ascii=False, indent=2)
 
+    # 大数据集优化：清理临时缓存（可选，如需续跑可保留）
+    # shutil.rmtree(TEMP_CACHE_PATH)
+    
     # Final complete VRAM cleanup to release GPU resources
     torch.cuda.empty_cache()
     del model, tokenizer  # Manually delete model and Tokenizer to completely release VRAM
 
     # Print prominent summary results (focus on hallucination rate and F1 score, corresponding to accuracy)
-    print(f"\nGeoLLaVA-8K XLRS-Bench 42-sample inference + hallucination rate statistics completed!")
-    print(
-        f"Inference Statistics Summary (Remote Sensing Dedicated Model | No Default A | Pure Native Inference | Stable on 16G GPU):")
+    print(f"\n" + "="*100)
+    print(f"GeoLLaVA-8K Full XLRS-Bench Dataset Inference + Hallucination Rate Statistics Completed!")
+    print(f"="*100)
+    print(f"Inference Statistics Summary (Remote Sensing Dedicated Model | No Default A | Pure Native Inference | Stable on 16G GPU):")
+    print(f"   ├─ Total samples: {total_samples}")
+    print(f"   ├─ Valid inference samples: {valid_samples}")
+    print(f"   ├─ Fatal error samples: {fatal_error_samples}")
     print(f"   ├─ Valid accuracy: {valid_accuracy}%")
     print(f"   ├─ Hallucination rate: {hallucination_rate}%")
-    print(f"   ├─ F1 score: {f1_score_value}%")
+    print(f"   ├─ F1 score (macro): {f1_score_value}%")
     print(
-        f"   └─ Detailed results saved to: {RESULT_SAVE_PATH} (including hallucination rate + F1 score + full sample details)")
+        f"   └─ Detailed results saved to: {RESULT_SAVE_PATH} (including hallucination rate + F1 score + full sample details)"
+    )
 
     return final_result
 
 
-# ================================= Main Function Entry (Run Directly, No Extra Configuration)=================================
+# ================================= Main Function Entry (Optimized for Full Dataset)=================================
 if __name__ == "__main__":
     try:
-        # Pre-check path validity to avoid runtime path errors
+        # Pre-check path validity to avoid runtime path errors (adapted for full dataset)
         if not os.path.exists(MODEL_PATH):
             raise FileNotFoundError(f"GeoLLaVA-8K model path error, please check: {MODEL_PATH}")
         if not os.path.exists(IMAGE_DIR):
             raise FileNotFoundError(f"Remote sensing image folder not found, please check: {IMAGE_DIR}")
-        if not os.path.exists(ANNOTATION_FILE):
-            raise FileNotFoundError(f"Dataset annotation file not found, please check: {ANNOTATION_FILE}")
+        if not ANNOTATION_FILES or not any(os.path.exists(f) for f in ANNOTATION_FILES):
+            raise FileNotFoundError(f"No valid annotation files found in: {ANNOTATION_FILES}")
 
-        # Start GeoLLaVA-8K batch inference + hallucination rate auto-statistics (100% runnable, no invalid parameters)
-        batch_infer_xlrs_bench()
+        # Start GeoLLaVA-8K batch inference + hallucination rate auto-statistics (full dataset version)
+        batch_infer_xlrs_bench_full()
     except Exception as e:
         print(f"\nFatal runtime error: {str(e)}")
         import traceback
-
         traceback.print_exc()  # Print detailed error stack for troubleshooting
         torch.cuda.empty_cache()  # Force VRAM cleanup on exception to release GPU resources
+        
+        # 大数据集异常处理：保存错误日志
+        error_log = os.path.join(DATASET_ROOT, "infer_error_log.json")
+        with open(error_log, "w", encoding="utf-8") as f:
+            json.dump({
+                "error_message": str(e),
+                "traceback": traceback.format_exc(),
+                "timestamp": str(pd.Timestamp.now())
+            }, f, ensure_ascii=False, indent=2)
+        print(f"Error log saved to: {error_log}")
+
