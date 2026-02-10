@@ -206,7 +206,7 @@ def infer_single_sample(processor, model, image_path, question, options, all_opt
 # ================================= Batch Inference Main Function (42 Samples, No Default A, Pure Precise Inference)=================================
 def batch_infer_xlrs_bench():
     """
-    XLRS-Bench 42-sample batch inference
+    XLRS-Bench full-sample batch inference
     Core features: no default A, no fallback, no randomness, no splitting, empty value re-inference
     Results are traceable, include raw model output, valid accuracy aligns with real model capability
     """
@@ -325,7 +325,7 @@ def batch_infer_xlrs_bench():
     torch.cuda.empty_cache()
 
     # Print summary statistical results (clear and intuitive, core indicators at a glance)
-    print(f"\nXLRS-Bench 42-sample inference without default A completed!")
+    print(f"\nXLRS-Bench full-sample inference without default A completed!")
     print(f"Inference Statistics Summary (Pure Precise, No Manual Fallback):")
     print(f"   ├─ Valid inference accuracy: {valid_accuracy}%")
     print(f"   ├─ Re-inference rate: {re_infer_rate}%")
@@ -350,4 +350,5 @@ if __name__ == "__main__":
         print(f"\nProgram startup failed (fatal error): {str(e)}")
         import traceback
         traceback.print_exc()
+
         torch.cuda.empty_cache()
