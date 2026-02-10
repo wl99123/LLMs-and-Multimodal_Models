@@ -1,0 +1,27 @@
+[
+    {
+        "image_id": 1,
+        "question": "图片的尺寸大概是多少？",
+        "answer": "800x600像素"
+    },
+    {
+        "image_id": 2,
+        "question": "图片中的动物是什么？",
+        "answer": "猫"
+    },
+    {
+        "image_id": 3,
+        "question": "图片是风景照吗？",
+        "answer": "是"
+    },
+    {
+        "image_id": 4,
+        "question": "图片的主色调是什么？",
+        "answer": "蓝色"
+    },
+    {
+        "image_id": 5,
+        "question": "图片中有人物吗？",
+        "answer": "无"
+    }
+]
