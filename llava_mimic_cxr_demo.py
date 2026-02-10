@@ -8,13 +8,15 @@ import pandas as pd
 from sklearn.metrics import accuracy_score, f1_score
 from transformers import AutoProcessor, LlavaForConditionalGeneration, BitsAndBytesConfig
 import warnings
+import glob  # Added: for traversing all parquet files
+from tqdm import tqdm  # Added: for progress bar of full dataset
 
 warnings.filterwarnings('ignore')
 
 # ===================== Core Configuration (No Modification Needed) ======================
 DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
 MODEL_PATH = "/root/autodl-tmp/models/llava-v1.5-7b"
-PARQUET_PATH = "/root/autodl-tmp/datasets/mimic-cxr-dataset/train-00000-of-00002.parquet"
+DATASET_ROOT = "/root/autodl-tmp/datasets/mimic-cxr-dataset/"  # Modified: Dataset root directory
 OUTPUT_DIR = "/root/autodl-tmp/datasets/mimic-cxr-dataset/llava_optimized_best"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 EVAL_DIMENSIONS = ["Thoracic Cage", "Bilateral Lung Fields", "Lung Markings", "Cardiac Shadow", "Diaphragmatic Surface and Costophrenic Angles"]
@@ -43,28 +45,38 @@ for param in model.parameters():
     param.requires_grad = False
 print(f"Model initialization completed | Device: {DEVICE}")
 
-# ===================== 2. Dataset Loading (Native, No Redundancy) ======================
-print(f"\nLoading MIMIC-CXR dataset...")
-df_temp = pd.read_parquet(PARQUET_PATH)
-raw_data = df_temp.to_dict("records")
-del df_temp
+# ===================== 2. Dataset Loading (Modified: Load entire dataset) ======================
+print(f"\nLoading full MIMIC-CXR dataset...")
+
+# Traverse all parquet files in the dataset directory
+parquet_files = glob.glob(os.path.join(DATASET_ROOT, "*.parquet"))
+if not parquet_files:
+    raise FileNotFoundError(f"No parquet files found in dataset directory! Path: {DATASET_ROOT}")
+print(f"Found {len(parquet_files)} parquet files: {parquet_files}")
+
+# Load all valid samples from all parquet files
 infer_data = []
-# 核心修改：仅加载前100个有效样本
-MAX_SAMPLES = 100  # 限制测试样本数为100
-sample_count = 0
-for item in raw_data:
-    if sample_count >= MAX_SAMPLES:
-        break  # 达到100个样本后停止
-    if isinstance(item.get("image"), bytes) and len(item.get("image", b"")) >= 100:
-        infer_data.append({
-            "image": item["image"],
-            "findings": str(item.get("findings", "No desc")).strip() or "No desc",
-            "impression": str(item.get("impression", "No desc")).strip() or "No desc"
-        })
-        sample_count += 1  # 仅计数有效样本
+total_raw_samples = 0
+for parquet_file in parquet_files:
+    df_temp = pd.read_parquet(parquet_file)
+    raw_data = df_temp.to_dict("records")
+    total_raw_samples += len(raw_data)
+    
+    # Filter valid samples (no sample limit)
+    for item in raw_data:
+        if isinstance(item.get("image"), bytes) and len(item.get("image", b"")) >= 100:
+            infer_data.append({
+                "image": item["image"],
+                "findings": str(item.get("findings", "No desc")).strip() or "No desc",
+                "impression": str(item.get("impression", "No desc")).strip() or "No desc"
+            })
+    
+    # Release memory immediately after processing each parquet file
+    del df_temp, raw_data
+    torch.cuda.empty_cache()
+
 TOTAL_NUM_CLEAN = len(infer_data)
-del raw_data
-print(f"Dataset loading completed | Number of valid samples (first 100): {TOTAL_NUM_CLEAN}")
+print(f"Dataset loading completed | Total raw samples: {total_raw_samples} | Total valid samples: {TOTAL_NUM_CLEAN}")
 
 # ===================== 3. Core Utility Functions (All Bugs Fixed, Accurate Evaluation) ======================
 def extract_medical_conclusion(report, is_original=True):
@@ -129,7 +141,7 @@ def judge_hallucination(ori_con, gen_con, gen_report, ori_report):
 
 # ===================== 4. Single Sample Inference (Core Fix: Resolve Prompt Repetition) ======================
 def infer_single_optimized(sample, idx):
-    sample_id = f"sample_{idx:06d}"
+    sample_id = f"sample_{idx:08d}"  # Modified: 8-digit ID for large dataset
     json_path = os.path.join(OUTPUT_DIR, f"{sample_id}.json")
     result = {
         "sample_id": sample_id, "index": idx, "infer_status": "success",
@@ -193,8 +205,8 @@ def infer_single_optimized(sample, idx):
         result["generated_conclusion"] = gen_con
         result["is_hallucination"] = is_hallu
         result["hallucination_type"] = hallu_type
-        # Console print progress (Simplified output to reduce screen refresh)
-        if (idx + 1) % 10 == 0:  # 调整：前100样本每10个打印一次进度，更直观
+        # Console print progress (Adjust for large dataset: print every 100 samples)
+        if (idx + 1) % 100 == 0:  # Modified: print progress every 100 samples for large dataset
             print(f"\n" + "-" * 70)
             print(f"Sample ID: {sample_id} | Progress: {idx + 1}/{TOTAL_NUM_CLEAN} ({(idx + 1) / TOTAL_NUM_CLEAN * 100:.1f}%)")
             print(f"Original: {'Abnormal' if ori_con else 'Normal'} | Model: {'Abnormal' if gen_con else 'Normal'} | Hallucination: {'Yes' if is_hallu else 'No'}")
@@ -203,7 +215,7 @@ def infer_single_optimized(sample, idx):
     except Exception as e:
         result["infer_status"] = "failed"
         result["error_msg"] = f"{type(e).__name__}: {str(e)[:500]}"
-        if (idx + 1) % 10 == 0:
+        if (idx + 1) % 100 == 0:
             print(f"\nSample ID: {sample_id} | Progress: {idx + 1}/{TOTAL_NUM_CLEAN} | Failed: {str(e)[:80]}")
     finally:
         # Optimize memory cleaning: Only release image cache, reduce CUDA operations
@@ -214,9 +226,9 @@ def infer_single_optimized(sample, idx):
             json.dump(result, f, ensure_ascii=False, indent=2)
         return result
 
-# ===================== 5. Full Inference Main Process (Efficiency Optimization for Large Samples) ======================
-print(f"\nStarting full inference (Optimized Version) | Valid Samples (first 100): {TOTAL_NUM_CLEAN} | No PNG Saving + Accurate Evaluation")
-print(f"Results saved to: {OUTPUT_DIR} | Print progress every 10 samples")
+# ===================== 5. Full Inference Main Process (Efficiency Optimization for Large Dataset) ======================
+print(f"\nStarting full inference (Optimized Version) | Total Valid Samples: {TOTAL_NUM_CLEAN} | No PNG Saving + Accurate Evaluation")
+print(f"Results saved to: {OUTPUT_DIR} | Print progress every 100 samples")
 total_stats = {
     "total_clean": TOTAL_NUM_CLEAN,
     "success": 0, "failed": 0,
@@ -225,7 +237,8 @@ total_stats = {
 }
 
 try:
-    for idx, sample in enumerate(infer_data):
+    # Modified: Add tqdm progress bar for large dataset
+    for idx, sample in tqdm(enumerate(infer_data), total=TOTAL_NUM_CLEAN, desc="Processing samples"):
         res = infer_single_optimized(sample, idx)
         if res["infer_status"] == "success":
             total_stats["success"] += 1
@@ -238,11 +251,11 @@ try:
                 total_stats["hallu_detail"][ht] = total_stats["hallu_detail"].get(ht, 0) + 1
         else:
             total_stats["failed"] += 1
-        # Optimize memory cleaning strategy: Deep clean every 50 samples (适配前100样本)
-        if (idx + 1) % 50 == 0:
+        # Optimize memory cleaning strategy: Deep clean every 500 samples for large dataset
+        if (idx + 1) % 500 == 0:
             torch.cuda.empty_cache()
             torch.cuda.ipc_collect()
-            print(f"\nMemory Optimization: Processed {idx + 1} samples, deep cleaning completed\n")
+            tqdm.write(f"\nMemory Optimization: Processed {idx + 1} samples, deep cleaning completed\n")
 except KeyboardInterrupt:
     print(f"\nManual interruption detected, saving current results...")
 except Exception as e:
@@ -252,7 +265,8 @@ except Exception as e:
 print(f"\nCalculating final evaluation metrics (Including Accuracy, F1 Score, Hallucination Rate)...")
 eval_report = {
     "data_statistics": {
-        "Number of Valid Samples (first 100)": TOTAL_NUM_CLEAN,
+        "Total Raw Samples": total_raw_samples,
+        "Total Valid Samples": TOTAL_NUM_CLEAN,
         "Number of Successful Inferences": total_stats["success"],
         "Number of Failed Inferences": total_stats["failed"],
         "Inference Success Rate (%)": round(total_stats["success"] / TOTAL_NUM_CLEAN * 100, 2) if TOTAL_NUM_CLEAN > 0 else 0.0
@@ -298,17 +312,17 @@ if total_stats["success"] > 0:
             eval_report["hallucination_statistics"]["Proportion of Each Hallucination Type (%)"][ht] = round(
                 cnt / total_stats["hallu_count"] * 100, 2)
 
-# Save evaluation report
-eval_report_path = os.path.join(OUTPUT_DIR, "optimized_evaluation_report_first_100.json")  # 文件名标注前100样本
+# Save evaluation report (Modified: Remove "first 100" from filename)
+eval_report_path = os.path.join(OUTPUT_DIR, "optimized_evaluation_report_full_dataset.json")
 with open(eval_report_path, "w", encoding="utf-8") as f:
     json.dump(eval_report, f, ensure_ascii=False, indent=2)
 
 # ===================== 7. Print Final Results (Including F1 Score, All Core Metrics) ======================
 print(f"\n" + "=" * 80)
-print(f"LLaVA-v1.5-7b Inference Optimized Version Completed! (First 100 Samples Tested)")
+print(f"LLaVA-v1.5-7b Inference Optimized Version Completed! (Full Dataset Processed)")
 print(f"All results saved to: {OUTPUT_DIR}")
 print(f"=" * 80)
-print(f"\nInference Basic Statistics (First 100 Samples):")
+print(f"\nInference Basic Statistics (Full Dataset):")
 for k, v in eval_report["data_statistics"].items():
     print(f"   • {k}: {v}")
 print(f"\nCore Evaluation Metrics (Including F1 Score You Need):")
@@ -324,8 +338,9 @@ if eval_report["hallucination_statistics"]["Total Hallucination Samples"] > 0:
 else:
     print(f"   • No hallucination samples!")
 print(f"\nKey Result Files:")
-print(f"   • {eval_report_path}: Optimized Evaluation Report (First 100 Samples, Including F1 Score)")
-print(f"   • sample_xxxxxx.json: Single Sample Details (Pure Diagnosis Report + Accurate Evaluation)")
+print(f"   • {eval_report_path}: Optimized Evaluation Report (Full Dataset, Including F1 Score)")
+print(f"   • sample_xxxxxxxx.json: Single Sample Details (Pure Diagnosis Report + Accurate Evaluation)")
 print(f"\n" + "=" * 80)
-print(f"Fix Summary: 1. Optimize Prompt to prohibit repetition 2. Force filter prompt residue after generation 3. Add F1 Score calculation 4. Limit to first 100 samples")
+print(f"Fix Summary: 1. Optimize Prompt to prohibit repetition 2. Force filter prompt residue after generation 3. Add F1 Score calculation 4. Process full dataset")
+
 print(f"=" * 80)
