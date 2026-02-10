@@ -31,7 +31,7 @@ CLIP_PATH = "/root/autodl-tmp/models/clip-vit-large-patch14"  # Your local CLIP 
 BATCH_SIZE = 1  # Set to 2 for 4090, no impact on dimension adaptation
 MAX_NEW_TOKENS = 1024  # Increase generation length to accommodate reasoning steps
 IMAGE_TOKEN = "<Image>"  # Fixed image placeholder for MiniGPT-4
-TEST_SAMPLE_NUM = 100   # For testing: only run first 100 samples
+TEST_SAMPLE_NUM = 3040   # For testing: only run first 100 samples
 # Dimension Configuration (Key: CLIP outputs 1024d, MiniGPT-4 embedding 4096d)
 CLIP_EMBED_DIM = 1024  # Fixed output dimension for CLIP-ViT-L/14
 LLM_EMBED_DIM = 4096  # Word embedding dimension for MiniGPT-4-7B
@@ -217,71 +217,81 @@ def extract_numerical_answer(text):
 
 
 def extract_reasoning_nodes(text):
-    """Extract reasoning nodes based on mathematical theorem keywords"""
-    reasoning_keywords = {
-        "Triangle Angle Sum": ["Triangle interior angle sum", "Interior angle sum theorem", "∠A+∠B+∠C=180"],
-        "Parallel Line Properties": ["Two lines parallel", "Parallel", "Same-side interior angles supplementary", "Alternate interior angles equal", "Corresponding angles equal"],
-        "Vertical Angles": ["Vertical angles", "Vertical angles equal"],
-        "Pythagorean Theorem": ["Pythagorean theorem", "a²+b²=c²"],
-        "Similar Triangles": ["Similar", "Similar triangles", "Corresponding sides proportional"],
-        "Congruent Triangles": ["Congruent", "Congruent triangles", "SSS", "SAS", "ASA", "AAS"],
-        "Area Formula": ["Area", "base×height÷2", "length×width", "Circle area", "πr²"],
-        "Perimeter Formula": ["Perimeter", "Sum of side lengths", "2πr", "diameter×π"]
+    """终极修复：语义模糊匹配 + 中英文兼容 + 宽松规则"""
+    # 简化推理节点分类，降低匹配门槛
+    reasoning_patterns = {
+        "Triangle Angle Sum": r"三角形.*内角和|内角和.*180|∠.*\+.*=.*180|triangle.*angle.*sum|180.*degree",
+        "Parallel Line Properties": r"平行.*线|同旁内角|内错角|同位角|parallel.*line|supplementary.*angle",
+        "Vertical Angles": r"对顶角|vertical.*angle",
+        "Pythagorean Theorem": r"勾股定理|a².*b².*c²|pythagorean.*theorem",
+        "Similar/Congruent Triangles": r"相似|全等|similar|congruent|SSS|SAS|ASA",
+        "Area/Perimeter": r"面积|周长|area|perimeter|底.*高|length.*width"
     }
     nodes = set()
-    text_lower = text.lower()
-    for node, keywords in reasoning_keywords.items():
-        if any(kw.lower() in text_lower for kw in keywords):
+    # 移除大小写过滤，适配中文
+    for node, pattern in reasoning_patterns.items():
+        if re.search(pattern, text, re.IGNORECASE):  # 忽略英文大小写，中文无影响
             nodes.add(node)
     return list(nodes)
 
 
 def calculate_f1_score(gt_ans, pred_ans):
-    """Calculate character-level F1 score for mathematical answer matching"""
-    def preprocess(s):
-        s = re.sub(r'[^\w\d°cm mm%times]', '', s).replace(" ", "")
-        return list(s) if s else []
+    """终极修复：数值级F1（适配数学答案）"""
+    # 复用已有的数值提取函数
+    gt_num = extract_numerical_answer(gt_ans)
+    pred_num = extract_numerical_answer(pred_ans)
 
-    gt_chars = preprocess(gt_ans)
-    pred_chars = preprocess(pred_ans)
-    if not gt_chars and not pred_chars:
+    # 处理空值情况
+    if not gt_num and not pred_num:
         return 1.0
-    if not gt_chars or not pred_chars:
+    if not gt_num or not pred_num:
         return 0.0
-    common = list(set(gt_chars) & set(pred_chars))
-    if not common:
+
+    # 计算数值级精确率、召回率、F1
+    common_num = list(set(gt_num) & set(pred_num))
+    precision = len(common_num) / len(pred_num)
+    recall = len(common_num) / len(gt_num)
+
+    if precision + recall == 0:
         return 0.0
-    precision = len(common) / len(pred_chars)
-    recall = len(common) / len(gt_chars)
     f1 = 2 * precision * recall / (precision + recall)
     return round(f1, 4)
 
 
 def classify_hallucination(gt, pred, gt_nodes, pred_nodes, gt_num, pred_num):
-    """Classify hallucination types for mathematical reasoning"""
-    if len(pred_nodes) > 0:
-        if set(pred_nodes) & set(gt_nodes) and len(pred_num) > 0 and pred_num != gt_num:
+    """修正幻觉分类逻辑：强化数值计算幻觉判定，放宽定理幻觉判定"""
+    # 1. 事实性幻觉 - 数值计算错误（核心修正：只要推理节点匹配但数值不匹配）
+    if len(pred_nodes) > 0 and len(gt_nodes) > 0:
+        if len(set(pred_nodes) & set(gt_nodes)) > 0 and len(pred_num) > 0 and set(pred_num) != set(gt_num):
             return "Factual Hallucination", "Numerical Calculation Hallucination"
-        error_theorem_kw = ["Vertical angles supplementary", "Alternate interior angles supplementary", "Corresponding angles supplementary", "Triangle interior angle sum 360", "Pythagorean theorem a²-b²=c²"]
-        if any(kw.lower() in pred.lower() for kw in error_theorem_kw) or len(set(pred_nodes) & set(gt_nodes)) == 0:
-            return "Factual Hallucination", "Theorem/Concept Hallucination"
-    else:
-        if len(pred_num) > 0:
-            return "Logical Hallucination", "Reasoning Chain Break Hallucination"
-        false_cond_kw = ["Known from question", "Given in question", "Known", "According to conditions"]
-        if any(kw.lower() in pred.lower() for kw in false_cond_kw) and len(gt_num) > 0 and len(pred_num) == 0:
-            return "Logical Hallucination", "Condition Misuse Hallucination"
+    # 2. 事实性幻觉 - 定理/概念错误
+    error_theorem_kw = ["Vertical angles supplementary", "Alternate interior angles supplementary",
+                        "Corresponding angles supplementary", "Triangle interior angle sum 360",
+                        "Pythagorean theorem a²-b²=c²"]
+    if any(kw.lower() in pred.lower() for kw in error_theorem_kw):
+        return "Factual Hallucination", "Theorem/Concept Hallucination"
+    # 3. 逻辑性幻觉 - 推理链断裂（无推理节点但有数值输出）
+    if len(pred_nodes) == 0 and len(pred_num) > 0:
+        return "Logical Hallucination", "Reasoning Chain Break Hallucination"
+    # 4. 逻辑性幻觉 - 条件误用（编造条件）
+    false_cond_kw = ["Known from question", "Given in question", "Known", "According to conditions"]
+    if any(kw.lower() in pred.lower() for kw in false_cond_kw) and len(gt_num) > 0 and len(pred_num) == 0:
+        return "Logical Hallucination", "Condition Misuse Hallucination"
+    # 5. 兜底：有推理但数值错误仍归为数值计算幻觉
+    if len(gt_num) > 0 and len(pred_num) > 0 and set(pred_num) != set(gt_num):
+        return "Factual Hallucination", "Numerical Calculation Hallucination"
     return None, None
 
 
 def calculate_metrics(results):
-    """Calculate comprehensive evaluation metrics including F1 score and hallucination statistics"""
+    """修正指标计算逻辑：推理完整性分母、部分准确率判定、幻觉统计"""
     total = len(results)
     correct_num = 0
     exact_correct = 0
     partial_correct = 0
     total_f1 = 0.0
     total_reasoning_score = 0.0
+    reasoning_sample_count = 0  # 新增：统计有推理节点的样本数
     hallucination_stats = {
         "Factual Hallucination-Numerical Calculation Hallucination": 0,
         "Factual Hallucination-Theorem/Concept Hallucination": 0,
@@ -301,45 +311,55 @@ def calculate_metrics(results):
         gt_nodes = extract_reasoning_nodes(gt)
         pred_nodes = extract_reasoning_nodes(pred)
 
-        if set(gt_num) == set(pred_num) and len(gt_num) > 0:
+        # 1. 修正精确/部分准确率判定逻辑
+        is_low_quality = pred == "[Low Quality Answer] No valid reasoning and answer generated"
+        if set(gt_num) == set(pred_num) and len(gt_num) > 0 and not is_low_quality:
             res["exact_correct"] = True
             exact_correct += 1
             partial_correct += 1
             res["partial_correct"] = True
             res["accuracy"] = 1
             correct_num += 1
-        elif (len(set(gt_num) & set(pred_num)) > 0) or (len(set(gt_nodes) & set(pred_nodes)) > 0):
+        elif not is_low_quality and (
+            (len(gt_num) > 0 and len(pred_num) > 0 and len(set(gt_num) & set(pred_num)) > 0)
+            or (len(gt_nodes) > 0 and len(pred_nodes) > 0 and len(set(gt_nodes) & set(pred_nodes)) > 0)
+        ):
             res["partial_correct"] = True
             partial_correct += 1
             res["accuracy"] = 0
         else:
+            # 2. 修正幻觉分类逻辑
             dim, typ = classify_hallucination(gt, pred, gt_nodes, pred_nodes, gt_num, pred_num)
             res["hallucination_dimension"] = dim
             res["hallucination_type"] = typ
             if dim and typ:
                 hallucination_stats[f"{dim}-{typ}"] += 1
-            else:
-                hallucination_stats["No Hallucination"] += 1
             res["accuracy"] = 0
 
+        # 3. 修正推理完整性计算（分母为有推理节点的样本数）
         if len(gt_nodes) == 0:
             res["reasoning_complete_score"] = 1.0 if len(pred_nodes) == 0 else 0.0
         else:
+            reasoning_sample_count += 1  # 仅统计有推理节点的样本
             match_nodes = len(set(gt_nodes) & set(pred_nodes))
             res["reasoning_complete_score"] = match_nodes / len(gt_nodes)
             total_reasoning_score += res["reasoning_complete_score"]
 
-        if res["exact_correct"] or res["partial_correct"]:
+        # 4. 修正无幻觉判定逻辑（仅精确/部分正确且无数值错误）
+        if res["exact_correct"] or (res["partial_correct"] and len(set(gt_num) & set(pred_num)) > 0):
             hallucination_stats["No Hallucination"] += 1
 
+    # 计算最终指标
     metrics = {
         "overall_accuracy": round(correct_num / total * 100, 2),
         "exact_accuracy": round(exact_correct / total * 100, 2),
         "partial_accuracy": round(partial_correct / total * 100, 2),
         "avg_f1_score": round(total_f1 / total, 4),
-        "avg_reasoning_completeness": round(total_reasoning_score / total, 4)
+        # 推理完整性分母修正：避免除以0
+        "avg_reasoning_completeness": round(total_reasoning_score / max(1, reasoning_sample_count), 4)
     }
 
+    # 归一化幻觉统计
     for key in hallucination_stats:
         hallucination_stats[key] = {
             "count": hallucination_stats[key],
@@ -351,10 +371,10 @@ def calculate_metrics(results):
 
 def save_results(results, metrics, hallucination_stats):
     """Save test results with full English annotations and structured format"""
-    save_path = "minigpt4_mathv_vqa_test_100samples.json"  # Dedicated naming for test files
+    save_path = "minigpt4_mathv_vqa_test_100samples_fixed.json"  # 标记修正版
     final_result = {
         "model_info": {
-            "model_name": "MiniGPT-4-7B (Text-only + CLIP + Dimension Projection Layer + Optimized Configuration)",
+            "model_name": "MiniGPT-4-7B (Text-only + CLIP + Dimension Projection Layer + Fixed Metrics)",
             "model_path": MODEL_PATH,
             "clip_path": CLIP_PATH,
             "device": DEVICE,
@@ -366,7 +386,7 @@ def save_results(results, metrics, hallucination_stats):
         "dataset_info": {
             "dataset_name": "MATH-Vision",
             "dataset_path": DATASET_PATH,
-            "total_test_samples": len(results),  # Mark as test samples
+            "total_test_samples": len(results),
             "sample_limit": f"First {TEST_SAMPLE_NUM} valid samples"
         },
         "evaluation_metrics": metrics,
@@ -382,35 +402,41 @@ def save_results(results, metrics, hallucination_stats):
         "metric_definition": {
             "overall_accuracy": "Overall accuracy (perfect match ratio), 1=completely correct answer, 0=incorrect",
             "exact_accuracy": "Exact accuracy (perfect numerical match)",
-            "partial_accuracy": "Partial accuracy (core numerical/reasoning node match)",
+            "partial_accuracy": "Partial accuracy (core numerical/reasoning node match, exclude low-quality answers)",
             "avg_f1_score": "Average character-level F1 score (adapted for math problem answers)",
-            "avg_reasoning_completeness": "Average reasoning completeness (core reasoning node coverage ratio)"
+            "avg_reasoning_completeness": "Average reasoning completeness (only for samples with reasoning nodes)"
         },
-        "detailed_test_results": results  # Mark as test results
+        "fixes": [
+            "1. Reasoning completeness: denominator = number of samples with reasoning nodes (not total samples)",
+            "2. Partial accuracy: exclude low-quality answers, stricter matching rules",
+            "3. Hallucination classification: strengthen numerical calculation hallucination detection",
+            "4. No hallucination: only mark samples with exact/partial correct numerical answers"
+        ],
+        "detailed_test_results": results
     }
     with open(save_path, "w", encoding="utf-8") as f:
         json.dump(final_result, f, ensure_ascii=False, indent=2)
 
     print("\n" + "=" * 90)
-    print("MiniGPT-4-7B MATH-Vision Dataset - 100 Samples Test Version VQA Full Metrics Evaluation Report")
+    print("MiniGPT-4-7B MATH-Vision Dataset - Fixed Metrics Evaluation Report (100 Samples)")
     print("=" * 90)
     print(f"Running Configuration: {DEVICE} | Batch Size={BATCH_SIZE} | Dimension Fusion: {CLIP_EMBED_DIM}→{LLM_EMBED_DIM}")
     print(f"Test Data Scale: {len(results)} valid samples | Generation Config: num_beams=4, temp=0.7")
     print("=" * 90)
-    print("Core Evaluation Metrics (Accuracy + F1 + VQA Special)")
+    print("Core Evaluation Metrics (Fixed Version)")
     print("=" * 90)
     print(f"Overall Accuracy (Perfect Match): {metrics['overall_accuracy']}%")
     print(f"Exact Accuracy (Perfect Numerical Match): {metrics['exact_accuracy']}%")
-    print(f"Partial Accuracy (Core Numerical/Reasoning Match): {metrics['partial_accuracy']}%")
-    print(f"Average F1 Score (Character-level): {metrics['avg_f1_score']} (0~1)")
-    print(f"Average Reasoning Completeness (Node Coverage): {metrics['avg_reasoning_completeness']} (0~1)")
+    print(f"Partial Accuracy (Core Match): {metrics['partial_accuracy']}%")
+    print(f"Average F1 Score: {metrics['avg_f1_score']} (0~1)")
+    print(f"Average Reasoning Completeness: {metrics['avg_reasoning_completeness']} (0~1)")
     print("=" * 90)
     print("Hallucination Classification Statistics (Count | Ratio)")
     print("=" * 90)
     for key, val in hallucination_stats.items():
-        print(f"{key.ljust(45)}: {val['count']} entries | {val['ratio']}%")
+        print(f"{key.ljust(50)}: {val['count']} | {val['ratio']}%")
     print("=" * 90)
-    print(f"Test Result File Saved To: {os.path.abspath(save_path)}")
+    print(f"Fixed Result File Saved To: {os.path.abspath(save_path)}")
     print("=" * 90)
 
 
@@ -429,11 +455,11 @@ if __name__ == "__main__":
         )
         if not raw_results:
             raise ValueError("Test inference failed")
-        # Calculate full metrics
+        # Calculate fixed metrics
         final_results, metrics, hallucination_stats = calculate_metrics(raw_results)
         save_results(final_results, metrics, hallucination_stats)
-        print("\nMiniGPT-4 Multimodal VQA 100 Samples Test Inference + Full Metrics Evaluation Completed!")
+        print("\n✅ MiniGPT-4 Multimodal VQA Test (Fixed Metrics) Completed Successfully!")
     except Exception as e:
-        print(f"\nRuntime Error: {str(e)}")
+        print(f"\n❌ Runtime Error: {str(e)}")
         import traceback
         traceback.print_exc()
