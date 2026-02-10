@@ -11,6 +11,8 @@ from transformers import (AutoTokenizer, AutoModelForCausalLM,
                           CLIPImageProcessor, CLIPVisionModel,
                           BitsAndBytesConfig)
 import warnings
+import glob  # Added: for traversing all parquet files
+from tqdm import tqdm  # Added: for progress bar
 
 # Environment Configuration
 warnings.filterwarnings('ignore')
@@ -20,25 +22,25 @@ os.environ["TRANSFORMERS_NO_ADVISORY_WARNINGS"] = "1"
 DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
 TORCH_DTYPE = torch.float16 if torch.cuda.is_available() else torch.float32
 
-# ===================== Core Configuration (维度适配) ======================
-MODEL_PATH = "/root/autodl-tmp/models/llava-med-v1.5"  # LLaVA-MED根目录
-VISION_MODEL_PATH = "/root/autodl-tmp/models/clip-vit-large-patch14"  # 本地CLIP路径
-PARQUET_PATH = "/root/autodl-tmp/datasets/mimic-cxr-dataset/train-00000-of-00002.parquet"
+# ===================== Core Configuration (Dimension Adaptation) ======================
+MODEL_PATH = "/root/autodl-tmp/models/llava-med-v1.5"  # LLaVA-MED root directory
+VISION_MODEL_PATH = "/root/autodl-tmp/models/clip-vit-large-patch14"  # Local CLIP path
+DATASET_ROOT = "/root/autodl-tmp/datasets/mimic-cxr-dataset/"  # Dataset root directory
 OUTPUT_DIR = "/root/autodl-tmp/datasets/mimic-cxr-dataset/llava_med_multimodal_fixed"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 torch.cuda.empty_cache()
 
-# LLaVA-MED固定特殊token
+# LLaVA-MED fixed special tokens
 IMAGE_TOKEN = "<image>"
 IMAGE_PATCH_TOKEN = "<im_patch>"
 IMAGE_START_TOKEN = "<im_start>"
 IMAGE_END_TOKEN = "<im_end>"
 
-# 维度配置：CLIP-ViT-L/14输出1024维，LLaVA-MED期望4096维
-VISION_FEATURE_DIM = 1024  # CLIP输出维度
-LLAVA_EXPECTED_DIM = 4096  # LLaVA-MED输入维度
+# Dimension configuration: CLIP-ViT-L/14 outputs 1024 dimensions, LLaVA-MED expects 4096 dimensions
+VISION_FEATURE_DIM = 1024  # CLIP output dimension
+LLAVA_EXPECTED_DIM = 4096  # LLaVA-MED input dimension
 
-# ===================== 8bit量化配置（保留） ======================
+# ===================== 8-bit Quantization Configuration (Retained) ======================
 bnb_config = BitsAndBytesConfig(
     load_in_8bit=True,
     bnb_8bit_use_double_quant=True,
@@ -47,7 +49,7 @@ bnb_config = BitsAndBytesConfig(
 )
 
 
-# ===================== 校验本地CLIP模型文件 ======================
+# ===================== Check Local CLIP Model Files ======================
 def check_local_clip_model():
     required_files = ["config.json", "pytorch_model.bin", "preprocessor_config.json"]
     missing_files = []
@@ -56,13 +58,13 @@ def check_local_clip_model():
         if not os.path.exists(file_path):
             missing_files.append(file)
     if missing_files:
-        raise FileNotFoundError(f"本地CLIP模型缺失文件：{missing_files} | 路径：{VISION_MODEL_PATH}")
-    print(f"✅ 本地CLIP模型文件校验通过：{VISION_MODEL_PATH}")
+        raise FileNotFoundError(f"Local CLIP model missing files: {missing_files} | Path: {VISION_MODEL_PATH}")
+    print(f"✅ Local CLIP model files verified: {VISION_MODEL_PATH}")
 
 
-# ===================== 定义维度映射层（核心修复） ======================
+# ===================== Define Dimension Mapping Layer (Core Fix) ======================
 class VisionFeatureMapper(nn.Module):
-    """将CLIP的1024维特征映射为LLaVA-MED需要的4096维特征"""
+    """Map CLIP's 1024-dimensional features to 4096-dimensional features required by LLaVA-MED"""
 
     def __init__(self, input_dim=1024, output_dim=4096):
         super().__init__()
@@ -71,7 +73,7 @@ class VisionFeatureMapper(nn.Module):
             nn.ReLU(),
             nn.Linear(output_dim, output_dim)
         )
-        # 初始化权重（避免随机初始化导致的不稳定）
+        # Initialize weights (avoid instability caused by random initialization)
         for layer in self.projection:
             if isinstance(layer, nn.Linear):
                 nn.init.xavier_uniform_(layer.weight)
@@ -82,13 +84,13 @@ class VisionFeatureMapper(nn.Module):
         return self.projection(x)
 
 
-# ===================== 加载多模态组件（含维度映射） ======================
+# ===================== Load Multimodal Components (with Dimension Mapping) ======================
 def load_llava_med_multimodal():
     print("Loading LLaVA-MED-v1.5 Multimodal Model (Dimension Fixed)...")
-    # 1. 校验本地CLIP模型
+    # 1. Verify local CLIP model
     check_local_clip_model()
 
-    # 2. 加载本地视觉处理器和视觉编码器
+    # 2. Load local vision processor and vision encoder
     vision_processor = CLIPImageProcessor.from_pretrained(
         VISION_MODEL_PATH,
         local_files_only=True
@@ -100,13 +102,13 @@ def load_llava_med_multimodal():
         local_files_only=True,
         ignore_mismatched_sizes=True
     ).eval()
-    print(f"✅ 本地视觉模型加载完成: {VISION_MODEL_PATH}")
+    print(f"✅ Local vision model loaded: {VISION_MODEL_PATH}")
 
-    # 3. 加载维度映射层（核心修复）
+    # 3. Load dimension mapping layer (core fix)
     feature_mapper = VisionFeatureMapper(VISION_FEATURE_DIM, LLAVA_EXPECTED_DIM).to(DEVICE, TORCH_DTYPE).eval()
-    print(f"✅ 维度映射层加载完成：{VISION_FEATURE_DIM} → {LLAVA_EXPECTED_DIM}")
+    print(f"✅ Dimension mapping layer loaded: {VISION_FEATURE_DIM} → {LLAVA_EXPECTED_DIM}")
 
-    # 4. 加载文本tokenizer
+    # 4. Load text tokenizer
     tokenizer = AutoTokenizer.from_pretrained(
         MODEL_PATH,
         use_fast=False,
@@ -114,7 +116,7 @@ def load_llava_med_multimodal():
         padding_side="right",
         local_files_only=True
     )
-    # 添加图像相关特殊token
+    # Add image-related special tokens
     special_tokens = {
         "additional_special_tokens": [IMAGE_TOKEN, IMAGE_PATCH_TOKEN, IMAGE_START_TOKEN, IMAGE_END_TOKEN]
     }
@@ -124,7 +126,7 @@ def load_llava_med_multimodal():
     tokenizer.pad_token_id = tokenizer.eos_token_id
     print(f"✅ Text tokenizer loaded (vocab size: {len(tokenizer)})")
 
-    # 5. 加载LLaVA-MED语言模型
+    # 5. Load LLaVA-MED language model
     model = AutoModelForCausalLM.from_pretrained(
         MODEL_PATH,
         quantization_config=bnb_config,
@@ -136,60 +138,72 @@ def load_llava_med_multimodal():
         local_files_only=True
     ).eval()
     model.resize_token_embeddings(len(tokenizer))
-    print(f"✅ LLaVA-MED language model loaded (8bit quant)")
+    print(f"✅ LLaVA-MED language model loaded (8-bit quantized)")
 
     return tokenizer, model, vision_processor, vision_model, feature_mapper
 
 
-# 加载多模态模型（含维度映射）
+# Load multimodal model (with dimension mapping)
 try:
     tokenizer, model, vision_processor, vision_model, feature_mapper = load_llava_med_multimodal()
 except Exception as e:
-    print(f"❌ 多模态模型加载失败: {str(e)[:300]}")
+    print(f"Multimodal model loading failed: {str(e)[:300]}")
     exit(1)
 
-# ===================== Dataset Loading（保留） ======================
-print(f"\nLoading MIMIC-CXR dataset...")
-df_temp = pd.read_parquet(PARQUET_PATH)
-raw_data = df_temp.to_dict("records")
-del df_temp
+# ===================== Dataset Loading (Modified: Load entire dataset) ======================
+print(f"\nLoading full MIMIC-CXR dataset...")
 
-# Test with first 50 samples
+# Traverse all parquet files
+parquet_files = glob.glob(os.path.join(DATASET_ROOT, "*.parquet"))
+if not parquet_files:
+    raise FileNotFoundError(f"No parquet files found! Path: {DATASET_ROOT}")
+print(f"Found {len(parquet_files)} parquet files: {parquet_files}")
+
+# Load all data and filter valid samples
 infer_data = []
-for idx, item in enumerate(raw_data):
-    if idx >= 50:
-        break
-    if isinstance(item.get("image"), bytes) and len(item.get("image", b"")) >= 100:
-        try:
-            img = Image.open(io.BytesIO(item["image"])).convert("RGB")
-            infer_data.append({
-                "image": img,
-                "findings": str(item.get("findings", "No desc")).strip() or "No desc",
-                "impression": str(item.get("impression", "No desc")).strip() or "No desc"
-            })
-        except:
-            continue
+total_raw_samples = 0
+for parquet_file in parquet_files:
+    df_temp = pd.read_parquet(parquet_file)
+    raw_data = df_temp.to_dict("records")
+    total_raw_samples += len(raw_data)
+    
+    # Filter valid samples (with valid image data)
+    for item in raw_data:
+        if isinstance(item.get("image"), bytes) and len(item.get("image", b"")) >= 100:
+            try:
+                img = Image.open(io.BytesIO(item["image"])).convert("RGB")
+                infer_data.append({
+                    "image": img,
+                    "findings": str(item.get("findings", "No description")).strip() or "No description",
+                    "impression": str(item.get("impression", "No description")).strip() or "No description"
+                })
+            except Exception as e:
+                continue
+    del df_temp, raw_data  # Release memory
+
 TOTAL_NUM_CLEAN = len(infer_data)
-print(f"✅ Dataset loaded successfully | Valid multimodal samples: {TOTAL_NUM_CLEAN}")
+print(f"✅ Dataset loaded successfully | Total raw samples: {total_raw_samples} | Valid multimodal samples: {TOTAL_NUM_CLEAN}")
 
 
-# ===================== Utility Functions（保留） ======================
+# ===================== Utility Functions (English Version) ======================
 def extract_medical_conclusion(report, is_original=True):
     overall_con = 0
     if not is_original and report.strip() != "":
         conclusion_match = re.search(r'Overall Conclusion: (Normal|Abnormal)', report, re.IGNORECASE)
         if conclusion_match:
             return 1 if conclusion_match.group(1).lower() == "abnormal" else 0
-        abnormal_zh_kw = [
-            "异常", "增粗", "紊乱", "模糊", "结节", "积液", "增大", "抬高", "变钝",
-            "增多", "增厚", "浸润", "不张", "气胸", "实变", "水肿", "纤维化", "斑片影",
-            "条索影", "密度增高", "密度减低", "肋膈角消失", "心影增大", "胸膜增厚",
-            "炎症", "感染", "渗出", "空洞", "肺气肿", "肺大疱", "纵隔移位"
+        abnormal_en_kw = [
+            "abnormal", "effusion", "pneumothorax", "consolidation", "nodule", "mass",
+            "enlarged", "thickening", "opacity", "infiltrate", "atelectasis", "pleural",
+            "edema", "fibrosis", "inflammation", "infection", "exudation", "cavity",
+            "increased", "thickened", "infiltration", "collapse", "emphysema", "bullae",
+            "mediastinal shift", "increased density", "decreased density", "blunted",
+            "elevated", "enlargement", "distortion", "irregular", "calcification"
         ]
-        if any(kw in report for kw in abnormal_zh_kw):
+        if any(kw in report.lower() for kw in abnormal_en_kw):
             overall_con = 1
         return overall_con
-    if is_original and report != "No desc":
+    if is_original and report != "No description":
         report_lower = report.lower()
         abnormal_kw = [
             "abnormal", "effusion", "pneumothorax", "consolidation", "nodule", "mass",
@@ -211,7 +225,7 @@ def judge_hallucination(ori_con, gen_con):
     return 1, "Hallucination - No Valid Analysis"
 
 
-# ===================== 多模态推理核心函数（维度适配修复） ======================
+# ===================== Multimodal Inference Core Function (Dimension Adaptation Fixed) ======================
 def infer_single_multimodal(sample, idx):
     sample_id = f"sample_{idx:06d}"
     result = {
@@ -221,12 +235,12 @@ def infer_single_multimodal(sample, idx):
         "is_hallucination": 0, "hallu_type": "", "error": ""
     }
     try:
-        # 1. 原始报告处理
+        # 1. Original report processing
         ori_report = f"FINDINGS: {sample['findings']}\nIMPRESSION: {sample['impression']}"
         result["original_report"] = ori_report
         result["original_con"] = extract_medical_conclusion(ori_report, is_original=True)
 
-        # 2. 多模态Prompt构建
+        # 2. Multimodal Prompt construction
         prompt = (
             f"{IMAGE_TOKEN}You are a senior radiologist, analyze the chest X-ray strictly:\n"
             f"Clinical findings: {sample['findings'][:200]} (truncated)\n"
@@ -237,16 +251,16 @@ def infer_single_multimodal(sample, idx):
             f"Output requirements: Only medical analysis, no redundant remarks."
         )
 
-        # 3. 视觉特征编码 + 维度映射（核心修复）
+        # 3. Vision feature encoding + dimension mapping (core fix)
         image = sample["image"]
         vision_inputs = vision_processor(images=image, return_tensors="pt").to(DEVICE, TORCH_DTYPE)
         with torch.no_grad():
-            # CLIP输出1024维特征
+            # CLIP outputs 1024-dimensional features
             clip_features = vision_model(**vision_inputs).last_hidden_state  # (1, 257, 1024)
-            # 映射为4096维特征
+            # Map to 4096-dimensional features
             image_embeds = feature_mapper(clip_features)  # (1, 257, 4096)
 
-        # 4. 文本+图像融合编码
+        # 4. Text + image fusion encoding
         text_inputs = tokenizer(
             prompt,
             return_tensors="pt",
@@ -258,22 +272,22 @@ def infer_single_multimodal(sample, idx):
         attention_mask = text_inputs["attention_mask"]
         image_token_idx = (input_ids == tokenizer.convert_tokens_to_ids(IMAGE_TOKEN)).nonzero(as_tuple=True)[1][0]
 
-        # 构建融合后的输入embeds
-        text_embeds = model.get_input_embeddings()(input_ids)  # 文本embeds维度：(1, N, 4096)
+        # Build fused input embeddings
+        text_embeds = model.get_input_embeddings()(input_ids)  # Text embeddings dimension: (1, N, 4096)
         text_embeds = torch.cat([
             text_embeds[:, :image_token_idx + 1, :],
             image_embeds.to(TORCH_DTYPE),
             text_embeds[:, image_token_idx + 1:, :]
         ], dim=1)
 
-        # 调整注意力掩码
+        # Adjust attention mask
         new_attention_mask = torch.cat([
             attention_mask[:, :image_token_idx + 1],
             torch.ones((1, image_embeds.shape[1]), device=DEVICE),
             attention_mask[:, image_token_idx + 1:]
         ], dim=1)
 
-        # 5. 多模态推理
+        # 5. Multimodal inference
         with torch.no_grad():
             outputs = model.generate(
                 inputs_embeds=text_embeds,
@@ -289,19 +303,19 @@ def infer_single_multimodal(sample, idx):
                 early_stopping=True
             )
 
-        # 6. 解析输出
+        # 6. Parse output
         gen_report = tokenizer.decode(outputs[0], skip_special_tokens=True).strip()
         gen_report = gen_report.replace(prompt, "").strip()
         gen_report = re.sub(r'\n+', '\n', gen_report)
         gen_report = gen_report if len(gen_report) > 10 else "No valid analysis generated"
 
-        # 7. 结果统计
+        # 7. Result statistics
         result["generated_report"] = gen_report
         result["gen_con"] = extract_medical_conclusion(gen_report, is_original=False)
         result["is_hallucination"], result["hallu_type"] = judge_hallucination(result["original_con"],
                                                                                result["gen_con"])
 
-        # 打印进度
+        # Print progress
         if (idx + 1) % 10 == 0:
             print(f"\n" + "-" * 80)
             print(f"Sample {idx + 1}/{TOTAL_NUM_CLEAN} | ID: {sample_id}")
@@ -314,27 +328,28 @@ def infer_single_multimodal(sample, idx):
     except Exception as e:
         result["status"] = "failed"
         result["error"] = f"{type(e).__name__}: {str(e)[:200]}"
-        print(f"❌ Sample {sample_id} failed: {str(e)[:100]}")
+        print(f"Sample {sample_id} failed: {str(e)[:100]}")
     finally:
-        # 清理显存
+        # Clean up GPU memory
         if 'vision_inputs' in locals(): del vision_inputs
         if 'text_inputs' in locals(): del text_inputs
         if 'outputs' in locals(): del outputs
         torch.cuda.empty_cache()
-        # 保存结果
+        # Save results
         with open(os.path.join(OUTPUT_DIR, f"{sample_id}.json"), "w", encoding="utf-8") as f:
             json.dump(result, f, ensure_ascii=False, indent=2)
     return result
 
 
-# ===================== 主推理流程（保留） ======================
+# ===================== Main Inference Process (Modified: Process entire dataset) ======================
 print(f"\nStarting LLaVA-MED-v1.5 Multimodal Inference (Dimension Fixed)...")
 total_stats = {
     "total": TOTAL_NUM_CLEAN, "success": 0, "failed": 0,
     "hallu_count": 0, "ori_cons": [], "gen_cons": []
 }
 
-for idx, sample in enumerate(infer_data):
+# Use tqdm for progress bar
+for idx, sample in tqdm(enumerate(infer_data), total=TOTAL_NUM_CLEAN, desc="Processing samples"):
     res = infer_single_multimodal(sample, idx)
     if res["status"] == "success":
         total_stats["success"] += 1
@@ -345,7 +360,7 @@ for idx, sample in enumerate(infer_data):
     else:
         total_stats["failed"] += 1
 
-# ===================== 指标计算与输出（保留） ======================
+# ===================== Metrics Calculation and Output (English Version) ======================
 metrics = {
     "inference_success_rate(%)": round(total_stats["success"] / total_stats["total"] * 100, 2),
     "overall_accuracy(%)": round(accuracy_score(total_stats["ori_cons"], total_stats["gen_cons"]) * 100, 2) if
@@ -364,7 +379,7 @@ metrics = {
             "success"] * 100, 2) if total_stats["success"] > 0 else 0.0
 }
 
-# 保存最终报告
+# Save final report
 with open(os.path.join(OUTPUT_DIR, "llava_med_multimodal_fixed_evaluation_report.json"), "w", encoding="utf-8") as f:
     json.dump({
         "model_info": "LLaVA-MED-v1.5 Multimodal (Dimension Fixed: CLIP 1024 → LLaVA 4096)",
@@ -375,7 +390,7 @@ with open(os.path.join(OUTPUT_DIR, "llava_med_multimodal_fixed_evaluation_report
         "local_vision_model_path": VISION_MODEL_PATH
     }, f, ensure_ascii=False, indent=2)
 
-# 打印最终结果
+# Print final results
 print(f"\n" + "=" * 80)
 print(f"LLaVA-MED-v1.5 Multimodal Inference Completed (Dimension Fixed)")
 print(f"Result Directory: {OUTPUT_DIR}")
@@ -390,4 +405,5 @@ print(f"   • F1 Score (Binary): {metrics['f1_score']}")
 print(f"   • Hallucination Rate: {metrics['hallucination_rate(%)']}%")
 print(f"   • False Negative Rate: {metrics['false_negative_rate(%)']}%")
 print(f"   • False Positive Rate: {metrics['false_positive_rate(%)']}%")
+
 print(f"\n" + "=" * 80)
