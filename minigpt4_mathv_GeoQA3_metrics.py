@@ -31,7 +31,7 @@ CLIP_PATH = "/root/autodl-tmp/models/clip-vit-large-patch14"
 BATCH_SIZE = 1  # Set to 2 for 4090, no impact on dimension adaptation
 MAX_NEW_TOKENS = 1024  # Increase generation length to accommodate reasoning steps
 IMAGE_TOKEN = "<Image>"  # Fixed image placeholder for MiniGPT-4
-TEST_SAMPLE_NUM = 100  # For testing: only run first 100 valid samples
+TEST_SAMPLE_NUM = 3040  # For testing: only run first 100 valid samples
 # Dimension Configuration (Key: CLIP outputs 1024d, MiniGPT-4 embedding 4096d)
 CLIP_EMBED_DIM = 1024  # Fixed output dimension for CLIP-ViT-L/14
 LLM_EMBED_DIM = 4096  # Word embedding dimension for MiniGPT-4-7B
@@ -565,5 +565,6 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"\nRuntime Error: {str(e)}")
         import traceback
+
 
         traceback.print_exc()
