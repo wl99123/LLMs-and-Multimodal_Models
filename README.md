@@ -154,22 +154,17 @@ Design custom hallucination detection metrics and classification dimensions:
 2. General-Scenario VQA Task Evaluation
 Evaluate basic visual understanding and answer accuracy on COCO/VQAv2:
 ```bash
-# BLIP2-OPT-2.7b on VQAv2 (1000 samples)
+# BLIP2-OPT-2.7b evaluation
 python blip2_opt27b_vqa_test1000.py
-python blip2_opt27b_vqa_test1000_COT.py
-
-# BLIP2-OPT-2.7b on COCO
 python blip2_opt27b_vqa_test_coco.py
-python blip2_opt27b_vqa_test_coco_COT.py
 
-# LLaVA-v1.5-7b on COCO and VQAv2
+# LLaVA-v1.5-7b evaluation
 python llava15_coco_vqa_test.py
 python llava15_vqa_1000test.py
-python llava15_vqa_1000test_cot.py
-python llava15_coco_vqa_test_cot.py
 
 # Qwen2.5-VL-7B evaluation
-python eval_qwen2vl.py
+python qwen2vl_coco.py
+python qwen2vl_v2_1000.py
 ```
 3. Visual-Text Reasoning (Mathematical & Geometric)
 Evaluate complex reasoning capabilities on mathematical/geometric tasks:
